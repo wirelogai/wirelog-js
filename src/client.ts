@@ -11,6 +11,16 @@
  * remaining events on shutdown.
  */
 
+import {
+  RateLimiter,
+  parseRetryAfterMs,
+  type DropReason,
+  type RateLimitConfig,
+  type RateLimitStats,
+} from "./ratelimit.js";
+
+export type { DropReason, RateLimitConfig, RateLimitStats };
+
 // ---------------------------------------------------------------------------
 // Environment helpers
 // ---------------------------------------------------------------------------
@@ -25,6 +35,7 @@ const BATCH_MAX = 10;
 const QUEUE_MAX = 500;
 const RETRY_MAX = 3;
 const RETRY_BASE_MS = 1000;
+const MAX_BATCH_API_SIZE = 2000; // server's MaxBatchSize
 
 const ATTR_PARAMS = [
   "utm_source",
@@ -181,6 +192,27 @@ function applyAttributionProps(
   }
 }
 
+/**
+ * Measure the UTF-8 byte size of an event's JSON serialization.
+ * Returns -1 when the value can't be serialized (circular references,
+ * BigInt, etc.) so callers can treat it as a payload drop and avoid
+ * passing the event further into the queue / send pipeline.
+ */
+function measurePayloadSize(value: unknown): number {
+  let json: string;
+  try {
+    json = JSON.stringify(value);
+  } catch {
+    return -1;
+  }
+  if (typeof json !== "string") return -1;
+  try {
+    return new TextEncoder().encode(json).length;
+  } catch {
+    return json.length;
+  }
+}
+
 function envVar(name: string): string | undefined {
   if (isBrowserEnv()) return undefined;
   try {
@@ -202,6 +234,18 @@ export interface WireLogConfig {
   onError?: (err: Error) => void;
   /** Disable all tracking. track() becomes a no-op. Useful for tests. */
   disabled?: boolean;
+  /**
+   * Per-instance rate limiter configuration. Defaults are conservative
+   * (1 evt/s burst capacity 10, 60/min, 1000/hr, 10000/day, 64 KiB/event).
+   * Set `rateLimit: { disabled: true }` to bypass.
+   */
+  rateLimit?: RateLimitConfig;
+  /**
+   * Internal: clock override used by tests. Returns milliseconds (like
+   * Date.now). Not part of the stable API.
+   * @internal
+   */
+  _now?: () => number;
 }
 
 export interface TrackEvent {
@@ -246,14 +290,42 @@ export interface QueryOptions {
 
 type FlushReason = "manual" | "batch" | "interval" | "retry" | "hidden" | "pagehide" | "close";
 
-/** Error thrown when the WireLog API returns a non-2xx response. */
+/** Error thrown when the WireLog API returns a non-2xx response.
+ *
+ * `retryAfterMs` is set to the parsed Retry-After header (in
+ * milliseconds) on 429 responses, or 0 if absent or unparseable.
+ */
 export class WireLogError extends Error {
   status: number;
+  retryAfterMs: number;
 
-  constructor(status: number, message: string) {
+  constructor(status: number, message: string, retryAfterMs = 0) {
     super(`WireLog API ${status}: ${message}`);
     this.name = "WireLogError";
     this.status = status;
+    this.retryAfterMs = retryAfterMs;
+  }
+}
+
+/** Reported to onError when an event is dropped by the rate limiter. */
+export class RateLimitedError extends Error {
+  reason: DropReason;
+  constructor(reason: DropReason) {
+    super(`wirelog: event dropped (rate limited: ${reason})`);
+    this.name = "RateLimitedError";
+    this.reason = reason;
+  }
+}
+
+/** Reported to onError when an event exceeds the per-event size cap. */
+export class PayloadTooLargeError extends Error {
+  size: number;
+  limit: number;
+  constructor(size: number, limit: number) {
+    super(`wirelog: event dropped (payload ${size} bytes exceeds ${limit})`);
+    this.name = "PayloadTooLargeError";
+    this.size = size;
+    this.limit = limit;
   }
 }
 
@@ -279,12 +351,14 @@ export class WireLog {
   private _flushPromise: Promise<TrackResult> | null = null;
   private _browserHooksInstalled = false;
   private _closed = false;
+  private _limiter: RateLimiter;
 
   constructor(config: WireLogConfig = {}) {
     this.apiKey = config.apiKey ?? envVar("WIRELOG_API_KEY") ?? "";
     this.host = (config.host ?? envVar("WIRELOG_HOST") ?? "https://api.wirelog.ai").replace(/\/$/, "");
     this._disabled = config.disabled ?? false;
     this._onError = config.onError;
+    this._limiter = new RateLimiter(config.rateLimit, config._now);
     if (this.apiKey) this._initialized = true;
 
     if (isBrowserEnv()) {
@@ -321,6 +395,12 @@ export class WireLog {
     if (config.host) this.host = config.host.replace(/\/$/, "");
     if (config.onError) this._onError = config.onError;
     if (config.disabled !== undefined) this._disabled = config.disabled;
+    // Rebuild the limiter when the caller supplies new config or a clock
+    // override. This is the documented entry point for `wl.init({ rateLimit: ... })`
+    // on the singleton — silently ignoring it here breaks user expectations.
+    if (config.rateLimit !== undefined || config._now !== undefined) {
+      this._limiter = new RateLimiter(config.rateLimit, config._now);
+    }
     this._initialized = true;
   }
 
@@ -331,9 +411,35 @@ export class WireLog {
   async track(event: TrackEvent): Promise<TrackResult> {
     if (this._disabled || this._closed) return { accepted: 0 };
 
+    // L1+L2: rate limit BEFORE any enrichment so a hot loop is cheap.
+    const reason = this._limiter.allow();
+    if (reason !== "ok") {
+      this.reportError(new RateLimitedError(reason));
+      return { accepted: 0 };
+    }
+
     const body = this.enrichEvent(event);
     if (!this.ensureInitialized()) {
       return { accepted: 0, buffered: true };
+    }
+
+    // L5: per-event payload size cap (after enrichment so we measure
+    // the true wire size, before queueing).
+    const maxBytes = this._limiter.maxEventBytes();
+    if (maxBytes > 0) {
+      const size = measurePayloadSize(body);
+      if (size < 0) {
+        // Unserializable (circular ref, BigInt, …). Treat as a payload
+        // drop so it never wedges the inflight flush path later.
+        this._limiter.recordPayloadDrop();
+        this.reportError(new PayloadTooLargeError(0, maxBytes));
+        return { accepted: 0 };
+      }
+      if (size > maxBytes) {
+        this._limiter.recordPayloadDrop();
+        this.reportError(new PayloadTooLargeError(size, maxBytes));
+        return { accepted: 0 };
+      }
     }
 
     this.enqueueBrowserEvents([body]);
@@ -345,13 +451,59 @@ export class WireLog {
     return { accepted: 1, buffered: true };
   }
 
+  /** Snapshot of per-instance rate limiter drop counters. */
+  rateLimitStats(): RateLimitStats {
+    return this._limiter.stats();
+  }
+
   /**
    * Track multiple events in one request (up to 2000).
-   * Always sends immediately (explicit batch) and auto-injects identity/context per event.
+   *
+   * Each event is checked individually against the per-instance rate
+   * limiter (L1+L2) and the per-event payload size cap (L5). Events
+   * that fail either check are silently dropped from the batch and
+   * counted in `rateLimitStats()`. Batches larger than 2000 events
+   * throw (matches the server's `MaxBatchSize`). When the client is
+   * disabled or closed, returns `{ accepted: 0 }` without sending.
    */
   async trackBatch(events: TrackEvent[]): Promise<TrackResult> {
-    const enriched = events.map((e) => this.enrichEvent(e));
-    const body = isBrowserEnv() ? { events: enriched, clientOriginated: true } : { events: enriched };
+    if (this._disabled || this._closed) return { accepted: 0 };
+    if (events.length > MAX_BATCH_API_SIZE) {
+      throw new Error(
+        `wirelog: batch of ${events.length} events exceeds max ${MAX_BATCH_API_SIZE}`,
+      );
+    }
+
+    const maxBytes = this._limiter.maxEventBytes();
+    const survivors: TrackEvent[] = [];
+    for (const e of events) {
+      const reason = this._limiter.allow();
+      if (reason !== "ok") {
+        this.reportError(new RateLimitedError(reason));
+        continue;
+      }
+      const enriched = this.enrichEvent(e);
+      if (maxBytes > 0) {
+        const size = measurePayloadSize(enriched);
+        if (size < 0) {
+          this._limiter.recordPayloadDrop();
+          this.reportError(new PayloadTooLargeError(0, maxBytes));
+          continue;
+        }
+        if (size > maxBytes) {
+          this._limiter.recordPayloadDrop();
+          this.reportError(new PayloadTooLargeError(size, maxBytes));
+          continue;
+        }
+      }
+      survivors.push(enriched);
+    }
+
+    if (survivors.length === 0) return { accepted: 0 };
+
+    const body = isBrowserEnv()
+      ? { events: survivors, clientOriginated: true }
+      : { events: survivors };
     return this.post("/track", body) as Promise<TrackResult>;
   }
 
@@ -398,6 +550,13 @@ export class WireLog {
     const userID = (params.user_id || "").trim();
     if (!userID) {
       throw new Error("wirelog: identify requires non-empty user_id");
+    }
+
+    // identify counts against the same per-instance rate limiter as
+    // track so a remount loop can't open unbounded identify requests.
+    const reason = this._limiter.allow();
+    if (reason !== "ok") {
+      throw new RateLimitedError(reason);
     }
 
     let mergedOps = params.user_property_ops;
@@ -507,13 +666,19 @@ export class WireLog {
     this._retryTimer = null;
   }
 
-  private scheduleRetry(): void {
+  private scheduleRetry(retryAfterMs = 0): void {
     if (this._retryTimer || !this._queue.length) return;
-    const delay = Math.min(30000, RETRY_BASE_MS * Math.pow(2, this._retryCount));
+    // L6: prefer the server-provided Retry-After when present; jitter
+    // is unnecessary because the server has already chosen the time.
+    const baseDelay =
+      retryAfterMs > 0
+        ? Math.min(30000, retryAfterMs)
+        : Math.min(30000, RETRY_BASE_MS * Math.pow(2, this._retryCount));
+    const jitter = retryAfterMs > 0 ? 0 : Math.floor(Math.random() * 250);
     this._retryTimer = setTimeout(() => {
       this._retryTimer = null;
       void this.flushQueuedEvents("retry");
-    }, delay + Math.floor(Math.random() * 250));
+    }, baseDelay + jitter);
   }
 
   private installBrowserFlushHooks(): void {
@@ -579,7 +744,7 @@ export class WireLog {
         this._retryCount = 0;
         continue;
       }
-      this.scheduleRetry();
+      this.scheduleRetry(outcome.retryAfterMs);
       break;
     }
 
@@ -589,7 +754,7 @@ export class WireLog {
   private async sendTrackBatch(
     events: TrackEvent[],
     reason: FlushReason,
-  ): Promise<{ ok: boolean; retryable: boolean; accepted: number }> {
+  ): Promise<{ ok: boolean; retryable: boolean; accepted: number; retryAfterMs: number }> {
     try {
       const useKeepalive = reason === "hidden" || reason === "pagehide";
       const result = await this.post(
@@ -601,6 +766,7 @@ export class WireLog {
         ok: true,
         retryable: false,
         accepted: this.acceptedFromTrackResponse(result, events.length),
+        retryAfterMs: 0,
       };
     } catch (err) {
       if (err instanceof WireLogError) {
@@ -609,6 +775,7 @@ export class WireLog {
           ok: false,
           retryable: this.isRetryableStatus(err.status),
           accepted: 0,
+          retryAfterMs: err.retryAfterMs,
         };
       }
       if (!isBrowserEnv()) this.reportError(err instanceof Error ? err : new Error(String(err)));
@@ -616,6 +783,7 @@ export class WireLog {
         ok: false,
         retryable: true,
         accepted: 0,
+        retryAfterMs: 0,
       };
     }
   }
@@ -777,7 +945,8 @@ export class WireLog {
 
     if (!resp.ok) {
       const text = await resp.text();
-      throw new WireLogError(resp.status, text);
+      const retryAfterMs = parseRetryAfterMs(resp.headers.get("Retry-After"));
+      throw new WireLogError(resp.status, text, retryAfterMs);
     }
 
     const contentType = resp.headers.get("content-type") ?? "";
