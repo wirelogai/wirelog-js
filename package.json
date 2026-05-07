@@ -1,6 +1,6 @@
 {
   "name": "wirelog",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "WireLog analytics client for Node.js and browsers — zero runtime dependencies",
   "license": "MIT",
   "type": "module",
@@ -15,7 +15,8 @@
     }
   },
   "files": [
-    "dist"
+    "dist/**/*",
+    "!dist/**/*.test.*"
   ],
   "scripts": {
     "build": "tsc && npm run build:cjs",
