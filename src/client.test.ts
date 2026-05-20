@@ -5,7 +5,7 @@
 import { describe, it, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
-import { WireLog } from "./client.js";
+import { WireLog, __wirelogInternals } from "./client.js";
 
 interface MockRequest {
   path: string;
@@ -132,6 +132,16 @@ async function withBrowserEnv(
 }
 
 describe("WireLog client", () => {
+  it("builds stable choice hashes and assignment ids", () => {
+    const bucket = __wirelogInternals.hashBucket("pk_test", "production", "landing_h1", "landing_h1:variant", "u_123");
+    assert.equal(bucket >= 0 && bucket < 100000, true);
+    assert.equal(__wirelogInternals.subjectHash("u_123").startsWith("sha256:"), true);
+    assert.equal(
+      __wirelogInternals.choiceAssignmentId("pk_test", "production", "landing_h1", "v1", "u_123").startsWith("chas_"),
+      true,
+    );
+  });
+
   it("node track buffers and flush sends batched payload", async () => {
     mockResponse = {
       body: JSON.stringify({ accepted: 1 }),
@@ -252,6 +262,137 @@ describe("WireLog client", () => {
     assert.equal(result.ok, true);
     assert.equal(lastRequest?.path, "/identify");
     assert.equal(lastRequest?.body.user_id, "alice@acme.org");
+  });
+
+  it("choice requires identify, visitor, or an explicit subject before assignment", () => {
+    const wl = client();
+
+    assert.throws(
+      () => wl.choice("landing_h1", ["Welcome", "Best site"]),
+      /wirelog\.choice requires/,
+    );
+  });
+
+  it("choice resolves synchronously for explicit visitors and tracks exposure async", async () => {
+    mockResponse = {
+      body: JSON.stringify({ accepted: 1 }),
+      status: 200,
+      contentType: "application/json",
+    };
+    const wl = client();
+
+    const did = wl.visitor();
+    const selected = wl.choice("landing_h1", ["Welcome", "Best site"]);
+    assert.ok(["Welcome", "Best site"].includes(selected));
+
+    await wl.flush();
+    assert.equal(lastRequest?.path, "/track");
+    const events = lastRequest?.body.events as Array<Record<string, unknown>>;
+    assert.equal(events[0].event_type, "wirelog.exposure");
+    assert.equal(events[0].device_id, did);
+    const props = events[0].event_properties as Record<string, unknown>;
+    assert.equal(props.choice_key, "landing_h1");
+    assert.equal(props.choice_kind, "choice");
+    assert.equal(props.reason, "client_choice");
+    assert.equal(props.randomization_unit, "device_id");
+    assert.equal(String(events[0].insert_id).startsWith("chas_"), true);
+    await wl.close();
+  });
+
+  it("choice can use identify state before the identify request returns", async () => {
+    mockResponse = {
+      body: JSON.stringify({ ok: true, accepted: 1 }),
+      status: 200,
+      contentType: "application/json",
+    };
+    const wl = client();
+
+    const identifyPromise = wl.identify({ user_id: "user_123" });
+    const assignment = wl.assignment("landing_h1", [
+      { key: "welcome", value: "Welcome", weight: 20 },
+      { key: "best", value: "Best site", weight: 80 },
+    ]);
+
+    assert.equal(assignment.randomization_unit, "user_id");
+    assert.equal(assignment.reason, "client_choice");
+    await identifyPromise;
+    await wl.flush();
+
+    assert.equal(lastRequest?.path, "/track");
+    const events = lastRequest?.body.events as Array<Record<string, unknown>>;
+    assert.equal(events[0].user_id, "user_123");
+    const props = events[0].event_properties as Record<string, unknown>;
+    assert.equal(props.choice_key, "landing_h1");
+    assert.equal(props.variant_weight, String(assignment.variant_weight));
+    await wl.close();
+  });
+
+  it("choice version ignores localized payload changes when keys and weights are stable", () => {
+    const wl = client();
+
+    const english = wl.assignment("landing_h1", [
+      { key: "welcome", value: "Welcome to our site", weight: 50 },
+      { key: "best", value: "The best site in the world", weight: 50 },
+    ], {
+      subject: { user_id: "u_123" },
+      expose: false,
+    });
+    const spanish = wl.assignment("landing_h1", [
+      { key: "welcome", value: "Bienvenido a nuestro sitio", weight: 50 },
+      { key: "best", value: "El mejor sitio del mundo", weight: 50 },
+    ], {
+      subject: { user_id: "u_123" },
+      expose: false,
+    });
+
+    assert.equal(spanish.choice_version, english.choice_version);
+    assert.equal(spanish.assignment_id, english.assignment_id);
+    assert.equal(spanish.variant_key, english.variant_key);
+  });
+
+  it("choiceSeed preserves assignment across API key rotation", () => {
+    const variants = [
+      { key: "welcome", value: "Welcome", weight: 50 },
+      { key: "best", value: "Best", weight: 50 },
+    ];
+    const oldKey = new WireLog({ apiKey: "pk_old", host: baseUrl, choiceSeed: "proj_stable" });
+    const newKey = new WireLog({ apiKey: "pk_new", host: baseUrl, choiceSeed: "proj_stable" });
+
+    const a = oldKey.assignment("landing_h1", variants, {
+      subject: { user_id: "u_123" },
+      expose: false,
+    });
+    const b = newKey.assignment("landing_h1", variants, {
+      subject: { user_id: "u_123" },
+      expose: false,
+    });
+
+    assert.equal(b.assignment_id, a.assignment_id);
+    assert.equal(b.variant_key, a.variant_key);
+  });
+
+  it("choice warns when one key uses mixed randomization units", () => {
+    const wl = client();
+    const warnings: string[] = [];
+    const originalWarn = console.warn;
+    console.warn = (message?: unknown): void => {
+      warnings.push(String(message));
+    };
+    try {
+      wl.assignment("landing_h1", ["A", "B"], {
+        subject: { user_id: "u_123" },
+        expose: false,
+      });
+      wl.assignment("landing_h1", ["A", "B"], {
+        subject: { device_id: "dev_123" },
+        expose: false,
+      });
+    } finally {
+      console.warn = originalWarn;
+    }
+
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /used randomization unit 'user_id' and now 'device_id'/);
   });
 
   it("sends X-API-Key header", async () => {

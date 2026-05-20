@@ -30,6 +30,41 @@ wl.track({ event_type: "checkout", event_properties: { amount: 42 } });
 await wl.close();
 ```
 
+## Choices
+
+The TypeScript SDK supports synchronous client-side choices. Choices are
+declared in application code, require an explicit assignment unit, and record
+exposure through the same buffered `track()` queue and rate limiter.
+
+```typescript
+import { WireLog } from "wirelog";
+
+const wl = new WireLog({
+  apiKey: "pk_...",
+  environment: "production",
+  choiceSeed: "proj_...", // stable seed so API key rotation does not rebucket
+});
+await wl.identify({ user_id: "u_123" });
+
+const headline = wl.choice("landing_h1", [
+  { key: "welcome", value: "landing.h1.welcome" },
+  { key: "best", value: "landing.h1.best" },
+]);
+
+const assignment = wl.assignment("landing_h1", [
+  { key: "welcome", value: "Welcome to our site", weight: 40 },
+  { key: "best", value: "The best site in the world", weight: 60 },
+]);
+
+console.log(headline, assignment.variant_key);
+```
+
+Call `wl.visitor()` before `choice()` for anonymous device-level tests. Pass
+`{ expose: false }` to `assignment()` when you need a dry-run decision.
+For internationalization, keep variant `key` stable and use `value` for the
+translation key or localized payload. `choice_version` ignores `value`, so copy
+changes do not rebucket users while keys and weights are unchanged.
+
 ## Design Principles
 
 This client is designed to **never break your application**:
@@ -71,6 +106,7 @@ const client = new WireLog({
     console.error(err);
   },
   disabled: false,          // true = track() is a no-op
+  environment: "production", // SDK config environment
 });
 
 // Use the client
@@ -107,6 +143,31 @@ Run a pipe DSL query. Options: `format` (`"llm"`, `"json"`, `"csv"`), `limit`, `
 ### `wl.identify(params)`
 
 Bind a device to a user and/or set profile properties. Supports `user_property_ops` (`$set`, `$set_once`, `$add`, `$unset`).
+
+### `wl.visitor()`
+
+Explicitly select the current anonymous device as the assignment unit for
+`choice()`.
+
+### `wl.choice(key, variants, opts?)`
+
+Synchronously return a selected value and enqueue `wirelog.exposure`
+asynchronously. Requires `identify()`, `visitor()`, or `opts.subject`.
+
+### `wl.assignment(key, variants, opts?)`
+
+Return the full local assignment packet, including `variant_key`,
+`assignment_id`, and `subject_key_hash`.
+Choice options include `subject`, `unit`, `seed`/`choiceSeed`, `version`,
+`salt`, `weights`, `allocation`, `fallback`, `expose`, and `environment`.
+
+### `wl.choiceAsync(key, variants, opts?)`
+
+Promise-style wrapper around `choice()` for async call sites.
+
+### `wl.expose(assignment, subject)` / `wl.choiceStats()`
+
+Log a previously returned choice assignment and inspect exposure counters.
 
 ### `wl.reset()`
 
